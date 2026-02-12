@@ -1,0 +1,13 @@
+[package]
+name = "rusqlite-vtab-unnest"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+rusqlite = { version = "0.38.0", features = ["bundled", "uuid", "jiff", "vtab", "array", "value_pointer"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
+
+[patch.crates-io]
+# rusqlite = { git = 'https://github.com/GrahamDennis/rusqlite.git', branch = "gdennis/vtab-unsafe-values" }
+rusqlite = { path = '../../rusqlite/rusqlite' }
