@@ -1,5 +1,4 @@
-use std::any::Any;
-use std::ffi::{CStr, c_int, c_void};
+use std::ffi::c_int;
 use std::marker::PhantomData;
 use std::rc::Rc;
 
@@ -11,7 +10,6 @@ use rusqlite::vtab::{
     escape_double_quote, read_only_module,
 };
 use rusqlite::{Connection, Result};
-use std::str::FromStr;
 use tracing::{Level, trace};
 
 // http://sqlite.org/bindptr.html
@@ -110,9 +108,9 @@ unsafe impl<'vtab> VTab<'vtab> for UnnestTab {
         let column_names_bytes = &args[3..];
         let column_names_str = column_names_bytes
             .iter()
-            .map(|column_name_bytes| str::from_utf8(*column_name_bytes))
+            .map(|column_name_bytes| str::from_utf8(column_name_bytes))
             .collect::<Result<Vec<_>, _>>()
-            .map_err(|err| rusqlite::Error::Utf8Error(err))?;
+            .map_err(rusqlite::Error::Utf8Error)?;
         let column_count: usize = column_names_str.len();
         let vtab = Self {
             base: ffi::sqlite3_vtab::default(),
@@ -227,7 +225,6 @@ unsafe impl VTabCursor for UnnestTabCursor<'_> {
     #[tracing::instrument(skip(args), level=Level::TRACE)]
     fn filter(&mut self, idx_num: c_int, _idx_str: Option<&str>, args: &Filters<'_>) -> Result<()> {
         let cols: Vec<_> = (0..self.column_count)
-            .into_iter()
             .map(|idx| {
                 args.get_pointer(idx, VALUE_ARRAY_POINTER_TYPE)
                     .ok_or(rusqlite::Error::InvalidColumnIndex(idx))
