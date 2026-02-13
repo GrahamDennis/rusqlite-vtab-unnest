@@ -1,3 +1,30 @@
+//! Unnest Virtual Tables.
+//!
+//! This virtual table is inspired by PostgreSQL's
+//! [unnest](https://www.postgresql.org/docs/current/functions-array.html) table-valued function
+//!
+//!
+//! # Example
+//!
+//! ```
+//! # use rusqlite::{types::Value, Connection, Result, params};
+//! # use std::rc::Rc;
+//! # use rusqlite_vtab_unnest::vtab::unnest::ValueArray;
+//! fn example(db: &Connection) -> Result<()> {
+//!     // Note: This should be done once (usually when opening the DB).
+//!     rusqlite_vtab_unnest::vtab::unnest::load_module(&db)?;
+//!     // Note: virtual tables need to be constructed for each number of arguments desired
+//!     db.execute("CREATE VIRTUAL TABLE unnest2 using unnest(value_1, value_2)", [])?;
+//!     let v1 = ValueArray::from([1i64, 2, 3, 4]);
+//!     let v2 = ValueArray::from([5i64, 6, 7, 8]);
+//!     let mut stmt = db.prepare("SELECT value_1, value_2 from unnest(?1, ?2);")?;
+//!     let rows = stmt.query_map([v1, v2], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))?;
+//!     for row in rows {
+//!         println!("{:?}", row?);
+//!     }
+//!     Ok(())
+//! }
+//! ```
 use std::ffi::c_int;
 use std::marker::PhantomData;
 use std::rc::Rc;
@@ -44,9 +71,22 @@ impl ToSql for ValueArray {
     }
 }
 
+// FIXME: Add more From impls
 impl From<Vec<i64>> for ValueArray {
     fn from(value: Vec<i64>) -> Self {
         Self(Rc::new(ValueArrayInner::Integer(value)))
+    }
+}
+
+impl From<&[i64]> for ValueArray {
+    fn from(value: &[i64]) -> Self {
+        Self(Rc::new(ValueArrayInner::Integer(value.to_vec())))
+    }
+}
+
+impl<const N: usize> From<[i64; N]> for ValueArray {
+    fn from(value: [i64; N]) -> Self {
+        Self(Rc::new(ValueArrayInner::Integer(value.to_vec())))
     }
 }
 
@@ -271,9 +311,6 @@ unsafe impl VTabCursor for UnnestTabCursor<'_> {
 
 #[cfg(test)]
 mod test {
-    #[cfg(all(target_family = "wasm", target_os = "unknown"))]
-    use wasm_bindgen_test::wasm_bindgen_test as test;
-
     use super::*;
 
     use rusqlite::{Connection, Result};
