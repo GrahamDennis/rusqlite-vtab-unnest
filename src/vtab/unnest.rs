@@ -1,16 +1,18 @@
-use std::ffi::{CStr, c_int};
+use std::any::Any;
+use std::ffi::{CStr, c_int, c_void};
 use std::marker::PhantomData;
 use std::rc::Rc;
 
 use rusqlite::ffi;
 use rusqlite::types::{ToSql, ToSqlOutput, Value, ValueRef};
-use rusqlite::vtab::value_pointer::ValuePointer;
+use rusqlite::vtab::value_pointer::PointerType;
 use rusqlite::vtab::{
     Context, CreateVTab, Filters, IndexConstraintOp, IndexInfo, VTab, VTabConnection, VTabCursor,
-    eponymous_only_module, read_only_module,
+    escape_double_quote, read_only_module,
 };
 use rusqlite::{Connection, Result};
 use std::str::FromStr;
+use tracing::{Level, trace};
 
 // http://sqlite.org/bindptr.html
 /// Register the "unnest" module.
@@ -36,12 +38,11 @@ pub enum ValueArrayInner {
     Blob(Vec<Vec<u8>>),
 }
 
+const VALUE_ARRAY_POINTER_TYPE: PointerType<ValueArrayInner> = PointerType::new(c"ValueArrayInner");
+
 impl ToSql for ValueArray {
     fn to_sql(&self) -> Result<ToSqlOutput<'_>> {
-        Ok(ToSqlOutput::ValuePointer(ValuePointer {
-            value: self.0.clone(),
-            pointer_type: VALUE_ARRAY_TYPE,
-        }))
+        Ok(VALUE_ARRAY_POINTER_TYPE.to_sql(&self.0))
     }
 }
 
@@ -51,9 +52,9 @@ impl From<Vec<i64>> for ValueArray {
     }
 }
 
-impl ValueArray {
+impl ValueArrayInner {
     fn len(&self) -> usize {
-        match self.0.as_ref() {
+        match self {
             ValueArrayInner::Null(length) => *length,
             ValueArrayInner::Integer(items) => items.len(),
             ValueArrayInner::Real(items) => items.len(),
@@ -63,7 +64,7 @@ impl ValueArray {
     }
 
     fn get(&self, idx: usize) -> ToSqlOutput<'_> {
-        match self.0.as_ref() {
+        match self {
             ValueArrayInner::Null(_) => ToSqlOutput::Owned(Value::Null),
             ValueArrayInner::Integer(items) => ToSqlOutput::Owned(Value::Integer(items[idx])),
             ValueArrayInner::Real(items) => ToSqlOutput::Owned(Value::Real(items[idx])),
@@ -75,10 +76,9 @@ impl ValueArray {
     }
 }
 
-pub(crate) const VALUE_ARRAY_TYPE: &CStr = c"value_array";
-
 /// An instance of the unnset virtual table
 #[repr(C)]
+#[derive(Debug)]
 struct UnnestTab {
     /// Base class. Must be first
     base: ffi::sqlite3_vtab,
@@ -89,56 +89,63 @@ unsafe impl<'vtab> VTab<'vtab> for UnnestTab {
     type Aux = ();
     type Cursor = UnnestTabCursor<'vtab>;
 
+    #[tracing::instrument(
+        level = Level::TRACE,
+        skip_all,
+        fields(args=?args.iter().map(|a| str::from_utf8(a)).collect::<Result<Vec<_>, _>>()?),
+        ret,
+        err
+    )]
     fn connect(
         _: &mut VTabConnection,
         _aux: Option<&()>,
         args: &[&[u8]],
     ) -> Result<(String, Self)> {
-        let vtab = Self {
-            base: ffi::sqlite3_vtab::default(),
-            column_count: args.len(),
-        };
-        if args.len() != 4 {
+        if args.len() < 3 {
             return Err(rusqlite::Error::ModuleError(format!(
-                "Incorrect argument count, received {} arguments expected 1",
-                args.len() - 3
+                "Incorrect argument count, received {} arguments expected at least 3",
+                args.len()
             )));
         }
-        let column_count_bytes = args[3];
-        let column_count_str =
-            str::from_utf8(column_count_bytes).map_err(|err| rusqlite::Error::Utf8Error(err))?;
-        let column_count: usize = usize::from_str(column_count_str).map_err(|err| {
-            rusqlite::Error::ModuleError(format!(
-                "failed to parse column count '{}'; error {:?}",
-                column_count_str, err
-            ))
-        })?;
-        if column_count == 0 {
-            return Err(rusqlite::Error::ModuleError(
-                "Cannot create an unnest table with 0 columns".to_string(),
-            ));
+        let column_names_bytes = &args[3..];
+        let column_names_str = column_names_bytes
+            .iter()
+            .map(|column_name_bytes| str::from_utf8(*column_name_bytes))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|err| rusqlite::Error::Utf8Error(err))?;
+        let column_count: usize = column_names_str.len();
+        let vtab = Self {
+            base: ffi::sqlite3_vtab::default(),
+            column_count,
+        };
+
+        let mut sql = String::from("CREATE TABLE x(");
+        for (idx, column_name) in column_names_str.iter().enumerate() {
+            let escaped_column_name = escape_double_quote(column_name);
+            sql.push('"');
+            sql.push_str(&escaped_column_name);
+            sql.push_str(r#"", "pointer_"#);
+            sql.push_str(&escaped_column_name);
+            if idx == column_names_str.len() - 1 {
+                sql.push_str(r#"" hidden);"#);
+            } else {
+                sql.push_str(r#"" hidden, "#);
+            }
         }
-        Ok((
-            format!(
-                "CREATE TABLE x({}, {})",
-                (0..column_count)
-                    .map(|_| "value")
-                    .collect::<Vec<_>>()
-                    .join(", "),
-                (0..column_count)
-                    .map(|_| "pointer hidden")
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ),
-            vtab,
-        ))
+
+        Ok((sql, vtab))
     }
 
+    #[tracing::instrument(
+        level = Level::TRACE,
+        skip_all,
+        ret,
+        err
+    )]
     fn best_index(&self, info: &mut IndexInfo) -> Result<()> {
         // Index of the pointer= constraints
         let mut pointer_constraints: usize = 0;
         let expected_constraints: usize = (1 << self.column_count) - 1;
-        let column_count_i32 = self.column_count as i32;
         for (constraint, mut constraint_usage) in info.constraints_and_usages() {
             if !constraint.is_usable() {
                 continue;
@@ -146,17 +153,27 @@ unsafe impl<'vtab> VTab<'vtab> for UnnestTab {
             if constraint.operator() != IndexConstraintOp::SQLITE_INDEX_CONSTRAINT_EQ {
                 continue;
             }
-            if constraint.column() >= (self.column_count as i32) {
-                pointer_constraints |= 1 << (constraint.column() - column_count_i32);
-                constraint_usage.set_argv_index(constraint.column() - column_count_i32);
+            if (constraint.column() % 2) == 1 {
+                let col_idx = constraint.column() / 2;
+                trace!(col_idx, "Accepting constraint");
+                pointer_constraints |= 1 << col_idx;
+                constraint_usage.set_argv_index(1 + col_idx);
                 constraint_usage.set_omit(true);
             }
         }
-        if pointer_constraints != expected_constraints {
+        if pointer_constraints == expected_constraints {
+            trace!(
+                column_count = self.column_count,
+                pointer_constraints, expected_constraints, "supported access method",
+            );
             info.set_estimated_cost(1_f64);
             info.set_estimated_rows(100);
             info.set_idx_num(1);
         } else {
+            trace!(
+                column_count = self.column_count,
+                pointer_constraints, expected_constraints, "unsupported access method",
+            );
             return Err(rusqlite::Error::SqliteFailure(
                 rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT),
                 Some("Unsupported access method".to_string()),
@@ -176,6 +193,7 @@ impl<'vtab> CreateVTab<'vtab> for UnnestTab {
 
 /// A cursor for the unnset virtual table
 #[repr(C)]
+#[derive(Debug)]
 struct UnnestTabCursor<'vtab> {
     /// Base class. Must be first
     base: ffi::sqlite3_vtab_cursor,
@@ -183,7 +201,7 @@ struct UnnestTabCursor<'vtab> {
     row_id: usize,
     column_count: usize,
     /// The value arrays
-    cols: Option<Vec<Rc<ValueArray>>>,
+    cols: Option<Vec<Rc<ValueArrayInner>>>,
     phantom: PhantomData<&'vtab UnnestTab>,
 }
 
@@ -206,19 +224,17 @@ impl UnnestTabCursor<'_> {
     }
 }
 unsafe impl VTabCursor for UnnestTabCursor<'_> {
+    #[tracing::instrument(skip(args), level=Level::TRACE)]
     fn filter(&mut self, idx_num: c_int, _idx_str: Option<&str>, args: &Filters<'_>) -> Result<()> {
         let cols: Vec<_> = (0..self.column_count)
             .into_iter()
             .map(|idx| {
-                args.get_pointer(idx, VALUE_ARRAY_TYPE)
+                args.get_pointer(idx, VALUE_ARRAY_POINTER_TYPE)
                     .ok_or(rusqlite::Error::InvalidColumnIndex(idx))
             })
             .collect::<Result<Vec<_>>>()?;
-        let cols = cols
-            .into_iter()
-            .map(|col| col.downcast().map_err(|_| rusqlite::Error::InvalidQuery))
-            .collect::<Result<Vec<Rc<ValueArray>>>>()?;
 
+        trace!(?cols, "received unnest columns");
         self.cols = Some(cols);
         self.row_id = 1;
         Ok(())
@@ -234,13 +250,14 @@ unsafe impl VTabCursor for UnnestTabCursor<'_> {
     }
 
     fn column(&self, ctx: &mut Context, i: c_int) -> Result<()> {
-        let column_idx: usize = i as usize;
+        let column_idx: usize = (i as usize) / 2;
+        trace!(row_id = self.row_id, column_idx, "fetching cell");
         if let Some(ref columns) = self.cols {
             if column_idx < self.column_count {
                 let column = columns
-                    .get(i as usize)
+                    .get(column_idx)
                     .ok_or(rusqlite::Error::InvalidColumnIndex(column_idx))?;
-                let value = column.get(self.row_id);
+                let value = column.get(self.row_id - 1);
                 ctx.set_result(&value)
             } else {
                 Ok(())
@@ -265,6 +282,7 @@ mod test {
     use rusqlite::{Connection, Result};
     use std::rc::Rc;
 
+    #[test_log::test]
     #[test]
     fn test_unnest_one_argument() -> Result<()> {
         let db = Connection::open_in_memory()?;
@@ -273,7 +291,7 @@ mod test {
         let values = vec![1i64, 2, 3, 4];
         let ptr = ValueArray::from(values);
         {
-            db.execute("CREATE VIRTUAL TABLE unnest1 using unnest(1)", [])?;
+            db.execute("CREATE VIRTUAL TABLE unnest1 using unnest(value)", [])?;
 
             let mut stmt = db.prepare("SELECT value from unnest1(?1);")?;
             assert_eq!(1, Rc::strong_count(&ptr.0));
@@ -288,6 +306,43 @@ mod test {
             assert_eq!(4, count);
         }
         assert_eq!(1, Rc::strong_count(&ptr.0));
+        Ok(())
+    }
+
+    #[test_log::test]
+    #[test]
+    fn test_unnest_two_arguments() -> Result<()> {
+        let db = Connection::open_in_memory()?;
+        load_module(&db)?;
+
+        let values1 = vec![1i64, 2, 3, 4];
+        let ptr1 = ValueArray::from(values1);
+
+        let values2 = vec![5i64, 6, 7, 8];
+        let ptr2 = ValueArray::from(values2);
+        {
+            db.execute("CREATE VIRTUAL TABLE unnest2 using unnest(va, vb)", [])?;
+
+            let mut stmt = db.prepare("SELECT va, vb from unnest2(?1, ?2);")?;
+            assert_eq!(1, Rc::strong_count(&ptr1.0));
+            assert_eq!(1, Rc::strong_count(&ptr2.0));
+
+            let rows = stmt.query_map([&ptr1, &ptr2], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+            })?;
+            assert_eq!(2, Rc::strong_count(&ptr1.0));
+            assert_eq!(2, Rc::strong_count(&ptr2.0));
+            let mut count = 0;
+            for (i, pair) in rows.enumerate() {
+                let (value1, value2) = pair?;
+                assert_eq!(i as i64, value1 - 1);
+                assert_eq!(i as i64, value2 - 5);
+                count += 1;
+            }
+            assert_eq!(4, count);
+        }
+        assert_eq!(1, Rc::strong_count(&ptr1.0));
+        assert_eq!(1, Rc::strong_count(&ptr2.0));
         Ok(())
     }
 }
