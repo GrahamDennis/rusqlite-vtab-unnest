@@ -12,5 +12,4 @@ tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
 test-log = {version = "0.2", default-features = false, features = ["trace"]}
 
 [patch.crates-io]
-# rusqlite = { git = 'https://github.com/GrahamDennis/rusqlite.git', branch = "gdennis/vtab-unsafe-values" }
-rusqlite = { path = '../../rusqlite/rusqlite' }
+rusqlite = { git = 'https://github.com/GrahamDennis/rusqlite.git', branch = "gdennis/vtab-unsafe-values" }
